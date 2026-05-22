@@ -22,7 +22,7 @@ import subprocess
 import tempfile
 import fcntl
 
-from flask import Blueprint, flash, redirect, url_for, abort, request, make_response, send_from_directory, g, Response, jsonify
+from flask import Blueprint, flash, redirect, url_for, abort, request, make_response, send_from_directory, send_file, g, Response, jsonify, render_template
 from markupsafe import Markup
 from .cw_login import current_user
 from flask_babel import gettext as _
@@ -31,7 +31,9 @@ from sqlalchemy import and_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.exc import IntegrityError, OperationalError, InvalidRequestError
 from sqlalchemy.sql.expression import func, or_, text
+from werkzeug.utils import secure_filename
 
+from . import plugins as plugin_manager
 from . import constants, logger, helper, services, cli_param
 from . import db, calibre_db, ub, web_server, config, updater_thread, gdriveutils, \
     kobo_sync_status, schedule
@@ -94,6 +96,7 @@ def admin_required(f):
         abort(403)
 
     return inner
+
 
 
 @admi.before_app_request
@@ -3208,3 +3211,259 @@ def restore_calibre_db():
                     pass
         except Exception:
             pass
+
+# =============================================================================
+# PLUGIN MANAGEMENT ROUTES
+# =============================================================================
+# These routes handle the full lifecycle of Calibre plugins inside CW-NextGen:
+#   - Listing installed plugins
+#   - Uploading and installing a new plugin from a .zip file
+#   - Enabling / disabling a plugin
+#   - Deleting a plugin
+#   - Serving a dynamic configuration form (GET) backed by the AST parser
+#   - Persisting configuration values submitted from that form (POST)
+#   - Dispatching plugin-specific action buttons (POST /action)
+#
+# The configuration form schema is generated at request time by
+# calibre_plugin_parser.parse_plugin_zip(), which inspects the plugin's
+# source code via AST without executing it and produces a PluginSchema.
+# Previously saved values are merged into the response so the form
+# reflects the current state.
+# =============================================================================
+
+from dataclasses import asdict
+from .calibre_plugin_parser import parse_plugin_zip  # AST-based schema extractor
+
+
+@admi.route("/admin/plugins", methods=["GET", "POST"])
+@user_login_required
+@admin_required
+def manage_plugins():
+    """
+    GET   - Render the plugin management page with the list of installed plugins.
+    POST  - Accept a .zip upload, install the plugin, and redirect (PRG pattern).
+    """
+    if request.method == "POST":
+        # Validate: file part must be present
+        if 'file' not in request.files:
+            flash(_('No file part in the request'), category="error")
+            return redirect(url_for('admin.manage_plugins'))
+
+        file = request.files['file']
+
+        # Validate: user must have actually selected a file
+        if file.filename == '':
+            flash(_('No file selected'), category="error")
+            return redirect(url_for('admin.manage_plugins'))
+
+        if file and file.filename.lower().endswith('.zip'):
+            try:
+                # Sanitize the filename to prevent directory traversal attacks
+                filename = secure_filename(file.filename)
+
+                # Write to the OS temp dir to avoid Docker volume permission issues
+                temp_dir = tempfile.gettempdir()
+                save_path = os.path.join(temp_dir, filename)
+                file.save(save_path)
+
+                # Delegate the actual installation to the plugin manager
+                success, msg = plugin_manager.install_plugin(save_path)
+
+                if success:
+                    flash(msg, category="success")
+                else:
+                    flash(msg, category="error")
+
+            except Exception as e:
+                log.error("Plugin install error for %s: %s", file.filename, e)
+                flash(_("System error during installation: %(err)s", err=str(e)), category="error")
+            finally:
+                # Always clean up the temp file, regardless of install outcome
+                if os.path.exists(save_path):
+                    os.remove(save_path)
+        else:
+            flash(_('Invalid file type. Only .zip files are allowed.'), category="error")
+
+        # Redirect to GET to prevent form resubmission on page refresh (PRG pattern)
+        return redirect(url_for('admin.manage_plugins'))
+
+    # GET: render the page with the current list of installed plugins
+    installed_plugins = plugin_manager.get_plugins_list()
+    return render_title_template(
+        "plugin_admin.html",
+        plugins=installed_plugins,
+        title=_("Manage Plugins"),
+        page="plugins"
+    )
+
+
+@admi.route("/admin/plugins/delete/<string:name>")
+@user_login_required
+@admin_required
+def delete_plugin(name):
+    """Remove an installed plugin by name and redirect back to the list."""
+    success, msg = plugin_manager.remove_plugin(name)
+    flash(msg, category="success" if success else "error")
+    return redirect(url_for('admin.manage_plugins'))
+
+
+@admi.route("/admin/plugins/toggle/<string:name>/<string:action>")
+@user_login_required
+@admin_required
+def toggle_plugin_route(name, action):
+    """Enable or disable a plugin. `action` must be 'enable' or 'disable'."""
+    enable = (action == 'enable')
+    success, msg = plugin_manager.toggle_plugin(name, enable)
+    flash(msg, category="success" if success else "error")
+    return redirect(url_for('admin.manage_plugins'))
+
+
+@admi.route("/admin/plugin/config/<plugin_name>", methods=["GET", "POST"])
+@user_login_required
+@admin_required
+def plugin_config_api(plugin_name):
+    """
+    GET  - Parse the plugin ZIP with the AST parser and return a PluginSchema
+           JSON response, augmented with any previously saved configuration
+           values under the key "saved_values".
+
+    POST - Accept a JSON body of { field_name: value, ... } and persist it
+           to the plugin's settings file, merging with existing values so that
+           fields absent from the form are not lost.
+    """
+    calibre_db.ensure_session()
+
+    if request.method == "POST":
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({'status': 'error', 'message': _('No data provided')}), 400
+
+            settings_path = plugin_manager.get_plugin_settings_path(plugin_name)
+
+            # Load existing settings so we only overwrite what the form touched
+            current_settings = {}
+            if os.path.exists(settings_path):
+                try:
+                    with open(settings_path, 'r', encoding='utf-8') as f:
+                        current_settings = json.load(f)
+                except Exception as e:
+                    log.warning("Could not read existing settings for %s: %s", plugin_name, e)
+
+            current_settings.update(data)
+
+            os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+            with open(settings_path, 'w', encoding='utf-8') as f:
+                json.dump(current_settings, f, indent=4)
+
+            log.info("Plugin config saved for '%s'", plugin_name)
+            return jsonify({'status': 'success', 'message': _('Settings saved successfully')})
+
+        except Exception as e:
+            log.error("Error saving plugin config for %s: %s", plugin_name, e)
+            return jsonify({'status': 'error', 'message': str(e)}), 500
+
+    # -------------------------------------------------------------------------
+    # GET: build and return the PluginSchema via the AST parser
+    # -------------------------------------------------------------------------
+    try:
+        zip_path = plugin_manager.get_plugin_zip_path(plugin_name)
+    except Exception as e:
+        log.error("Could not locate ZIP for plugin '%s': %s", plugin_name, e)
+        return jsonify({'status': 'error', 'message': _('Plugin ZIP not found')}), 404
+
+    # Run the AST parser — this is a pure read operation, no code is executed
+    try:
+        schema = parse_plugin_zip(zip_path)
+        schema_dict = asdict(schema)
+    except Exception as e:
+        log.error("AST parser failed for plugin '%s': %s", plugin_name, e)
+        # Return a minimal low-confidence schema so the UI can show the JSON fallback
+        schema_dict = {
+            'plugin_name':    plugin_name,
+            'plugin_version': '',
+            'plugin_type':    '',
+            'config_class':   '',
+            'fields':         [],
+            'warnings':       [f"Parser error: {str(e)}"],
+            'confidence':     'low',
+        }
+
+    # Load previously saved values and attach them under "saved_values"
+    # so the frontend can pre-populate the form fields
+    saved_values = {}
+    settings_path = plugin_manager.get_plugin_settings_path(plugin_name)
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, 'r', encoding='utf-8') as f:
+                saved_values = json.load(f)
+        except Exception as e:
+            log.warning("Could not read saved settings for '%s': %s", plugin_name, e)
+
+    schema_dict['saved_values'] = saved_values
+    return jsonify(schema_dict)
+
+
+@admi.route("/admin/plugin/action/<plugin_name>", methods=["POST"])
+@user_login_required
+@admin_required
+def plugin_action_api(plugin_name):
+    """Start a plugin action asynchronously. Returns a session_id for polling."""
+    try:
+        data = request.get_json()
+        if not data or 'action' not in data:
+            return jsonify({'status': 'error', 'message': _('No action specified')}), 400
+
+        action_name = data['action']
+
+        try:
+            session_id = plugin_manager.run_plugin_action_async(plugin_name, action_name)
+        except NotImplementedError:
+            log.warning("No action handler for '%s' / '%s'", plugin_name, action_name)
+            return jsonify({
+                'status': 'error',
+                'message': _("Action '%(action)s' is not yet implemented for this plugin.", action=action_name)
+            }), 501
+
+        log.info("Plugin action '%s' on '%s': started session %s", action_name, plugin_name, session_id)
+        return jsonify({'status': 'running', 'session_id': session_id})
+
+    except Exception as e:
+        log.error("Unexpected error starting plugin action %s / %s: %s", plugin_name, data.get('action', '?'), e)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@admi.route("/admin/plugin/action/<plugin_name>/status/<session_id>", methods=["GET"])
+@user_login_required
+@admin_required
+def plugin_action_status_api(plugin_name, session_id):
+    """Poll the status of an async plugin action session."""
+    status = plugin_manager.get_plugin_action_status(session_id)
+    return jsonify(status)
+
+
+@admi.route("/admin/plugin/action/<plugin_name>/dialog_response/<session_id>", methods=["POST"])
+@user_login_required
+@admin_required
+def plugin_action_dialog_response_api(plugin_name, session_id):
+    """Submit the user's response to a Qt dialog intercepted from a plugin action."""
+    try:
+        data = request.get_json()
+        plugin_manager.respond_to_plugin_dialog(session_id, data)
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
+
+
+@admi.route("/admin/plugin/action/<plugin_name>/file/<session_id>/<path:filename>", methods=["GET"])
+@user_login_required
+@admin_required
+def plugin_action_file_api(plugin_name, session_id, filename):
+    """Download an exported file produced by a plugin action."""
+    path = plugin_manager.get_plugin_action_file(session_id, filename)
+    if not path:
+        return jsonify({'error': 'File not found'}), 404
+    return send_file(path, as_attachment=True, download_name=filename)
+
+
+# --- END PLUGIN MANAGEMENT ROUTES ---
