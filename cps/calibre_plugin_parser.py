@@ -9,9 +9,11 @@ Part of the Calibre-Web-NextGen plugin manager contribution.
 """
 
 import ast
-import zipfile
-import json
+import os
 import sys
+import json
+import zipfile
+import threading
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -164,7 +166,9 @@ def extract_plugin_metadata(source: str) -> dict:
                         meta["name"] = val
 
                 elif attr == "version":
-                    # version = (0, 0, 16) → "0.0.16"
+                    # Two common forms:
+                    #   version = (0, 0, 16) → "0.0.16"
+                    #   version = "1.0.0"    → "1.0.0"
                     if isinstance(item.value, ast.Tuple):
                         parts = [
                             str(elt.value)
@@ -172,6 +176,8 @@ def extract_plugin_metadata(source: str) -> dict:
                             if isinstance(elt, ast.Constant)
                         ]
                         meta["version"] = ".".join(parts)
+                    elif isinstance(item.value, ast.Constant) and isinstance(item.value.value, str):
+                        meta["version"] = item.value.value
 
     return meta
 
@@ -271,6 +277,14 @@ class ConfigClassVisitor(ast.NodeVisitor):
                     self._last_label = label_text.rstrip(": ")
 
             # Detect: self.button_name.clicked.connect(self.method_name)
+            #
+            # We only match this exact, fully-qualified pattern. Anything else
+            # — lambdas (`connect(lambda: self.foo())`), dict-indexed methods
+            # (`connect(self.handlers[key])`), or other signals like `triggered`
+            # / `released` — is silently skipped. Such buttons will surface in
+            # the schema as `connected_method == None`, and the runtime path
+            # in cps/plugins.py will raise NotImplementedError when they're
+            # clicked. Expand the match here if a target plugin needs it.
             if (
                 isinstance(call.func, ast.Attribute)
                 and call.func.attr == "connect"
@@ -446,12 +460,44 @@ def detect_config_files(zip_path: str) -> dict:
     return candidates
 
 
-# ── Main parser entry point ───────────────────────────────────────────────────
+# ── Result cache (keyed by zip_path + mtime) ──────────────────────────────────
+
+# Parsing a plugin ZIP can touch dozens of Python files and run a non-trivial
+# amount of AST work. The admin UI re-requests the schema every time the user
+# opens a plugin's configuration modal, so we cache by mtime to avoid redoing
+# the work when the ZIP hasn't changed.
+_parse_cache: dict = {}
+_parse_cache_lock = threading.Lock()
+
 
 def parse_plugin_zip(zip_path: str) -> PluginSchema:
     """
-    Main entry point. Parses a Calibre plugin ZIP file and returns a
-    PluginSchema describing all detected configuration fields.
+    Cached entry point. Returns the parsed PluginSchema for the given ZIP.
+    Cache is keyed by (zip_path, mtime) so editing/replacing the ZIP forces
+    a re-parse on the next call.
+    """
+    try:
+        mtime = os.path.getmtime(zip_path)
+    except OSError:
+        mtime = 0.0
+
+    with _parse_cache_lock:
+        cached = _parse_cache.get(zip_path)
+        if cached and cached[0] == mtime:
+            return cached[1]
+
+    schema = _do_parse_plugin_zip(zip_path)
+
+    with _parse_cache_lock:
+        _parse_cache[zip_path] = (mtime, schema)
+
+    return schema
+
+
+def _do_parse_plugin_zip(zip_path: str) -> PluginSchema:
+    """
+    Parses a Calibre plugin ZIP file and returns a PluginSchema describing
+    all detected configuration fields.
 
     The schema can be serialized to JSON and consumed by the frontend
     to render a dynamic configuration form.
@@ -551,98 +597,12 @@ def parse_plugin_zip(zip_path: str) -> PluginSchema:
     return schema
 
 
-# ── Demo / test with sample source code ──────────────────────────────────────
-
-# Simulated config.py for the DeACSM (ACSM Input) plugin.
-# This mirrors the typical structure of a real Calibre plugin config class
-# without requiring the actual ZIP to be present.
-SAMPLE_CONFIG_SOURCE = '''
-from PyQt5.Qt import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
-                       QLineEdit, QCheckBox, QComboBox, QSpinBox,
-                       QPushButton, QGroupBox)
-
-class ConfigWidget(QWidget):
-    def __init__(self):
-        QWidget.__init__(self)
-        layout = QVBoxLayout()
-        self.setLayout(layout)
-
-        # Adobe ID field
-        adobe_label = QLabel("Adobe ID Email:")
-        layout.addWidget(adobe_label)
-        self.adobe_email = QLineEdit()
-        self.adobe_email.setPlaceholderText("user@example.com")
-        layout.addWidget(self.adobe_email)
-
-        # ADE version selector
-        ade_label = QLabel("ADE Version to emulate:")
-        layout.addWidget(ade_label)
-        self.ade_version = QComboBox()
-        self.ade_version.addItems(["ADE 2.0.1", "ADE 3.0.1", "ADE 4.0.3", "ADE 4.5.11"])
-        layout.addWidget(self.ade_version)
-
-        # Anonymous authorization toggle
-        self.anonymous_auth = QCheckBox("Use anonymous authorization (no Adobe ID required)")
-        layout.addWidget(self.anonymous_auth)
-
-        # Download retry attempts
-        retry_label = QLabel("Download retry attempts:")
-        layout.addWidget(retry_label)
-        self.retry_count = QSpinBox()
-        self.retry_count.setMinimum(1)
-        self.retry_count.setMaximum(10)
-        layout.addWidget(self.retry_count)
-
-        # Action buttons
-        self.btn_link_account = QPushButton("Link to ADE account")
-        layout.addWidget(self.btn_link_account)
-
-        self.btn_export_key = QPushButton("Export account encryption key")
-        layout.addWidget(self.btn_export_key)
-'''
-
-
-def demo_with_sample():
-    """
-    Runs the AST parser against the built-in sample source code.
-    Used for quick testing without a real plugin ZIP file.
-    """
-    print("=" * 60)
-    print("DEMO: Parsing simulated DeACSM config.py")
-    print("=" * 60)
-
-    try:
-        tree = ast.parse(SAMPLE_CONFIG_SOURCE)
-    except SyntaxError as e:
-        print(f"Syntax error in sample source: {e}")
-        return
-
-    visitor = ConfigClassVisitor()
-    visitor.visit(tree)
-
-    schema = PluginSchema(
-        plugin_name="ACSM Input Plugin (DeACSM)",
-        plugin_version="0.0.16",
-        plugin_type="FileTypePlugin",
-        config_class=", ".join(visitor.config_classes_found),
-        fields=visitor.fields,
-        confidence="high" if len(visitor.fields) >= 2 else "medium",
-    )
-
-    print(json.dumps(asdict(schema), indent=2, ensure_ascii=False))
-    return schema
-
-
 def main():
     if len(sys.argv) > 1:
-        zip_path = sys.argv[1]
-        print(f"Parsing plugin: {zip_path}")
-        schema = parse_plugin_zip(zip_path)
+        schema = parse_plugin_zip(sys.argv[1])
         print(json.dumps(asdict(schema), indent=2, ensure_ascii=False))
     else:
         print("Usage: python calibre_plugin_parser.py plugin.zip")
-        print("Running built-in demo...\n")
-        demo_with_sample()
 
 
 if __name__ == "__main__":

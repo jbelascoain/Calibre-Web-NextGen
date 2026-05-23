@@ -3466,4 +3466,15 @@ def plugin_action_file_api(plugin_name, session_id, filename):
     return send_file(path, as_attachment=True, download_name=filename)
 
 
+@admi.route("/admin/plugin/action/<plugin_name>/cancel/<session_id>", methods=["POST", "DELETE"])
+@user_login_required
+@admin_required
+def plugin_action_cancel_api(plugin_name, session_id):
+    """Cancel a running plugin action — kill the subprocess and drop the session."""
+    cancelled = plugin_manager.cancel_plugin_action(session_id)
+    if not cancelled:
+        return jsonify({'status': 'not_found'}), 404
+    return jsonify({'status': 'cancelled'})
+
+
 # --- END PLUGIN MANAGEMENT ROUTES ---

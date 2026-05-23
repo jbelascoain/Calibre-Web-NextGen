@@ -1,10 +1,25 @@
 # -*- coding: utf-8 -*-
+"""
+Calibre plugin manager — installs/removes/configures Calibre plugins and runs
+their action buttons via an out-of-process subprocess driven by calibre-debug.
+
+Async pipeline overview:
+    1. run_plugin_action_async() — locates the plugin ZIP, asks the AST parser
+       which Python method is bound to the requested button, and starts a
+       background thread that launches `calibre-debug cps/plugin_runner.py`.
+    2. The runner script (see plugin_runner.py) executes the plugin method
+       inside Qt's environment, intercepting any Qt dialogs and forwarding
+       them as JSON to <dialog_dir>/dialog_request.json.
+    3. get_plugin_action_status() polls the session — returns 'running',
+       'dialog' (when the runner is waiting for the user), or 'done'.
+    4. respond_to_plugin_dialog() unblocks the runner with the user's reply.
+    5. The runner writes its final outcome to <dialog_dir>/result.json,
+       which the background thread parses to set the session's terminal state.
+"""
 import subprocess
 import re
 import os
-import ast
 import shutil
-import zipfile
 import threading
 import uuid
 import time
@@ -12,53 +27,95 @@ import json
 import tempfile
 from flask_babel import gettext as _
 
+from . import logger
+
+log = logger.create()
+
+
+# ── Configuration constants ──────────────────────────────────────────────────
+
+#: Kill the runner subprocess if it hasn't finished after this many seconds.
+SUBPROCESS_TIMEOUT = 300
+
+#: Keep finished sessions (and their dialog_dir) in memory this long, so the
+#: frontend has time to poll the final status and download any exported files.
+SESSION_RETENTION = 300
+
+#: Path to the runner script executed inside the calibre-debug subprocess.
+RUNNER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plugin_runner.py')
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
 def _get_subprocess_env():
+    """Build an env dict pointing calibre tools at the right config directory."""
     env = os.environ.copy()
     env['HOME'] = '/config'
     env['CALIBRE_CONFIG_DIRECTORY'] = '/config/.config/calibre'
     return env
 
+
+def _normalize_plugin_name(name):
+    """Lowercase + spaces → underscores. Used for file/dir paths on disk."""
+    return name.lower().replace(' ', '_')
+
+
+def _normalize_plugin_module(name):
+    """Reduce a plugin display name to a valid Python module identifier."""
+    return re.sub(r'[^a-z0-9_]', '', name.lower().replace(' ', '_').replace('-', '_'))
+
+
+# ── Plugin list / install / remove / toggle (synchronous calibre-customize) ─
+
 def get_plugins_list():
+    """Parse `calibre-customize -l` output into a list of plugin dicts."""
     try:
         result = subprocess.check_output(
-            ['calibre-customize', '-l'], 
+            ['calibre-customize', '-l'],
             stderr=subprocess.STDOUT,
             env=_get_subprocess_env()
         )
         output = result.decode('utf-8')
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
+        log.error("calibre-customize -l failed: %s", e)
         return []
 
     plugins = []
     lines = output.splitlines()
-    if not lines: return plugins
+    if not lines:
+        return plugins
 
     header = ""
     for line in lines:
         if line.startswith("Type") and "Name" in line and "Version" in line:
             header = line
             break
-    if not header: return plugins
-        
+    if not header:
+        return plugins
+
     idx_name, idx_version, idx_disabled = header.find("Name"), header.find("Version"), header.find("Disabled")
     if idx_name == -1 or idx_version == -1 or idx_disabled == -1:
+        # Fallback to the column offsets used by current calibre-customize output.
         idx_name, idx_version, idx_disabled = 22, 74, 88
 
     current_plugin = None
     for line in lines:
-        if not line.strip() or line.startswith("Type") or line.startswith("---"): continue
-        if line[0].isspace():
-            if current_plugin: current_plugin['description'] += line.strip() + " "
+        if not line.strip() or line.startswith("Type") or line.startswith("---"):
             continue
-            
+        if line[0].isspace():
+            if current_plugin:
+                current_plugin['description'] += line.strip() + " "
+            continue
+
         type_str = line[0:idx_name].strip()
         name_str = line[idx_name:idx_version].strip()
         version_str = line[idx_version:idx_disabled].strip()
         disabled_col = line[idx_disabled:].strip()
         disabled_str = disabled_col.split()[0] if disabled_col else "False"
-        
+
         if version_str.startswith('(') and version_str.endswith(')'):
-            if current_plugin: plugins.append(current_plugin)
+            if current_plugin:
+                plugins.append(current_plugin)
             clean_version = version_str.strip('()').replace(', ', '.')
             current_plugin = {
                 'name': name_str, 'version': clean_version,
@@ -67,37 +124,43 @@ def get_plugins_list():
         elif current_plugin:
             current_plugin['description'] += line.strip() + " "
 
-    if current_plugin: plugins.append(current_plugin)
-    
-    # Normalize plugin names to ensure consistency between list and config paths
-    # Some plugins appear as "KFX Input" in the list but are stored as "kfx_input" or similar
+    if current_plugin:
+        plugins.append(current_plugin)
+
     for p in plugins:
-        p['normalized_name'] = p['name'].lower().replace(' ', '_')
-        
+        p['normalized_name'] = _normalize_plugin_name(p['name'])
+
     return plugins
+
 
 def install_plugin(zip_path):
     try:
         subprocess.check_call(['calibre-customize', '--add', zip_path], env=_get_subprocess_env())
         return True, _("Plugin installed successfully. Please restart the server to apply changes.")
     except Exception as e:
+        log.error("Plugin install failed for %s: %s", zip_path, e)
         return False, str(e)
+
 
 def remove_plugin(plugin_name):
     try:
         subprocess.check_call(['calibre-customize', '--remove-plugin', plugin_name], env=_get_subprocess_env())
-        norm_name = plugin_name.lower().replace(' ', '_')
+        norm_name = _normalize_plugin_name(plugin_name)
         base_dir = '/config/.config/calibre/plugins'
-        json_path = os.path.join(base_dir, f"{norm_name}.json")
+        json_path = os.path.join(base_dir, "%s.json" % norm_name)
         folder_path = os.path.join(base_dir, plugin_name)
         if not os.path.exists(folder_path):
             folder_path = os.path.join(base_dir, norm_name)
-            
-        if os.path.exists(json_path): os.remove(json_path)
-        if os.path.isdir(folder_path): shutil.rmtree(folder_path)
+
+        if os.path.exists(json_path):
+            os.remove(json_path)
+        if os.path.isdir(folder_path):
+            shutil.rmtree(folder_path)
         return True, _("Plugin removed successfully. Please restart the server.")
     except Exception as e:
+        log.error("Plugin remove failed for %s: %s", plugin_name, e)
         return False, str(e)
+
 
 def toggle_plugin(plugin_name, enable=True):
     action = '--enable-plugin' if enable else '--disable-plugin'
@@ -105,160 +168,23 @@ def toggle_plugin(plugin_name, enable=True):
         subprocess.check_call(['calibre-customize', action, plugin_name], env=_get_subprocess_env())
         return True, _("Plugin status changed.")
     except Exception as e:
+        log.error("Plugin toggle (%s) failed for %s: %s", action, plugin_name, e)
         return False, str(e)
 
-def prettify_key(key):
-    return key.replace('_', ' ').replace('-', ' ').title()
 
 def get_plugin_settings_path(plugin_name):
-    # Normalize name for path lookup
-    norm_name = plugin_name.lower().replace(' ', '_')
-    
-    base_config_dir = '/config/.config/calibre/plugins'
-    return os.path.join(base_config_dir, f"{norm_name}.json")
-
-def get_plugin_defaults(plugin_name):
-    values, labels, help_text, groups = {}, {}, {}, {}
-    norm_name = plugin_name.lower().replace(' ', '_')
-    base_dir = '/config/.config/calibre/plugins'
-    
-    # Try to find the plugin directory to analyze its source code
-    # Calibre plugins are often extracted into folders with the same name as the plugin
-    plugin_folder = os.path.join(base_dir, plugin_name)
-    if not os.path.exists(plugin_folder):
-        plugin_folder = os.path.join(base_dir, norm_name)
-    
-    def analyze_source(content):
-        # 1. VALORES (defaults)
-        # Patrón A: defaults['key'] = value o prefs['key'] = value
-        matches = re.findall(r"(?:defaults|prefs)\[['\"](.+?)['\"]\]\s*=\s*([^#\n\r]+)", content)
-        for key, val_str in matches:
-            try: values[key] = ast.literal_eval(val_str.strip())
-            except: continue
-        
-        # Patrón B: self.option_name = value (común en clases de configuración)
-        class_matches = re.findall(r"self\.([a-zA-Z0-9_]+)\s*=\s*([^#\n\r]+)", content)
-        for key, val_str in class_matches:
-            if key not in values:
-                try: values[key] = ast.literal_eval(val_str.strip())
-                except: continue
-        
-        # Patrón C: Definiciones de diccionarios de configuración globales
-        global_prefs = re.findall(r"([a-zA-Z0-9_]+_PREFS)\s*=\s*(\{.*?\})", content, re.DOTALL)
-        for pref_name, pref_val in global_prefs:
-            try:
-                data = ast.literal_eval(pref_val)
-                if isinstance(data, dict):
-                    for k, v in data.items():
-                        if k not in values: values[k] = v
-            except: continue
-
-        # Patrón D: JSONConfig defaults (Específico de plugins como KFX Output)
-        json_defaults = re.findall(r"plugin_config\.defaults\[([a-zA-Z0-9_]+)\]\s*=\s*([^#\n\r]+)", content)
-        for key, val_str in json_defaults:
-            try:
-                try:
-                    values[key] = ast.literal_eval(val_str.strip())
-                except:
-                    var_match = re.search(rf'{key}\s*=\s*[\'"](.+?)[\'"]', content)
-                    if var_match:
-                        values[key] = var_match.group(1)
-                    else:
-                        values[key] = False
-            except: continue
-
-        # 2. DETECCIÓN DE ETIQUETAS Y GRUPOS (Estrategia de Proximidad y Widget)
-        current_group = "General Settings"
-        lines = content.split('\n')
-        
-        for line in lines:
-            # Detectar grupos de configuración (QGroupBox)
-            group_match = re.search(r'QGroupBox\s*\(\s*_\([\'"](.+?)[\'"]\)\s*\)', line)
-            if not group_match:
-                group_match = re.search(r'QGroupBox\s*\(\s*[\'"](.+?)[\'"]\s*\)', line)
-            if group_match:
-                current_group = group_match.group(1)
-            
-            # Vincular variables con etiquetas legibles
-            for key in values.keys():
-                # Patrón: self.key = QCheckBox("Label") o self.key = QLineEdit("Label")
-                widget_match = re.search(rf'self\.{re.escape(key)}\s*=\s*(?:Q\w+)\s*\(\s*_\([\'"](.+?)[\'"]\)', line)
-                if not widget_match:
-                    widget_match = re.search(rf'self\.{re.escape(key)}\s*=\s*(?:Q\w+)\s*\(\s*[\'"](.+?)[\'"]\)', line)
-                
-                if widget_match:
-                    labels[key] = widget_match.group(1).replace('&', '')
-                    groups[key] = current_group
-                    continue
-
-                # Patrón: .setText(_("Label")) o .setLabel(_("Label"))
-                text_match = re.search(rf'{re.escape(key)}\.(?:setText|setLabel)\s*\(\s*_\([\'"](.+?)[\'"]\)', line)
-                if not text_match:
-                    text_match = re.search(rf'{re.escape(key)}\.(?:setText|setLabel)\s*\(\s*[\'"](.+?)[\'"]\)', line)
-                
-                if text_match:
-                    labels[key] = text_match.group(1).replace('&', '')
-                    groups[key] = current_group
-
-        # Búsqueda por Proximidad (Si la etiqueta no está en la misma línea)
-        for key in values.keys():
-            if key not in labels:
-                for i, line in enumerate(lines):
-                    if key in line:
-                        block = "\n".join(lines[i:i+5])
-                        trans_match = re.search(r'_\([\'"](.+?)[\'"]\)', block)
-                        if trans_match:
-                            label_text = trans_match.group(1)
-                            if label_text.lower() != key.lower():
-                                labels[key] = label_text.replace('&', '')
-                                groups[key] = current_group
-                                break
-
-        # Fallback final: Si la etiqueta sigue vacía, usar prettify_key
-        for key in values.keys():
-            if key not in labels:
-                labels[key] = prettify_key(key)
-            if key not in groups:
-                groups[key] = "General Settings"
-
-        # 3. TOOLTIPS (Ayuda)
-        for match in re.finditer(r'\.setToolTip\s*\(\s*_\([\'"](.+?)[\'"]\)\s*\)', content):
-            tip = match.group(1)
-            scope = content[max(0, match.start()-100):match.start()]
-            var = re.search(r'\.([a-zA-Z0-9_]+)', scope)
-            if var and var.group(1) in values:
-                help_text[var.group(1)] = tip
-
-    # Search for configuration files in the plugin folder
-    if os.path.isdir(plugin_folder):
-        for root, dirs, files in os.walk(plugin_folder):
-            for file in files:
-                if (file in ['prefs.py', 'config.py', '__init__.py'] or 'prefs' in file or 'config' in file) and file.endswith('.py'):
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8', errors='ignore') as f:
-                            analyze_source(f.read())
-                    except Exception:
-                        continue
-    else:
-        # If the folder doesn't exist, the plugin might be just a ZIP file in the plugins directory
-        # We try both the original name and the normalized name for the ZIP file
-        for zip_name in [f"{plugin_name}.zip", f"{norm_name}.zip"]:
-            zip_path = os.path.join(base_dir, zip_name)
-            if os.path.exists(zip_path):
-                try:
-                    with zipfile.ZipFile(zip_path, 'r') as z:
-                        for name in z.namelist():
-                            if (any(x in name for x in ['prefs.py', 'config.py', '__init__.py']) or 'prefs' in name or 'config' in name) and name.endswith('.py'):
-                                with z.open(name) as f:
-                                    analyze_source(f.read().decode('utf-8', errors='ignore'))
-                except Exception:
-                    pass
-
-    return {"values": values, "labels": labels, "help": help_text, "groups": groups}
+    """Return the JSON config path for a plugin (the file may not exist yet)."""
+    norm_name = _normalize_plugin_name(plugin_name)
+    return os.path.join('/config/.config/calibre/plugins', "%s.json" % norm_name)
 
 
 def get_plugin_zip_path(plugin_name):
-    norm = plugin_name.lower().replace(' ', '_')
+    """
+    Resolve the on-disk ZIP path for a plugin. Searches the user's calibre
+    config directory first, falling back to the bundled plugins shipped with
+    the repository. Raises FileNotFoundError if nothing matches.
+    """
+    norm = _normalize_plugin_name(plugin_name)
     search = [
         ('/config/.config/calibre/plugins', plugin_name),
         ('/config/.config/calibre/plugins', norm),
@@ -266,263 +192,161 @@ def get_plugin_zip_path(plugin_name):
         ('/config/plugins', norm),
     ]
     for base, name in search:
-        path = os.path.join(base, f"{name}.zip")
+        path = os.path.join(base, "%s.zip" % name)
         if os.path.exists(path):
             return path
-    raise FileNotFoundError(f"ZIP not found for plugin '{plugin_name}'")
+    raise FileNotFoundError("ZIP not found for plugin '%s'" % plugin_name)
 
+
+# ── Async plugin action pipeline ────────────────────────────────────────────
 
 _active_sessions = {}
 _sessions_lock = threading.Lock()
 
 
-def _build_subprocess_script(zip_path, config_class, method_name, plugin_module, dialog_dir):
-    # calibre-debug -c runs exec(code, globals, locals) with SEPARATE dicts.
-    # Top-level `def` goes into locals; function __globals__ is globals.
-    # So functions cannot see each other via LOAD_GLOBAL.
-    # Fix: wrap everything in _run() so all names are accessible via closures.
-    lines = [
-        "def _run():",
-        "    import sys, os, zipfile, tempfile, importlib.util, types, json, time, shutil",
-        f"    _zip={repr(zip_path)}",
-        f"    _cls_name={repr(config_class)}",
-        f"    _method={repr(method_name)}",
-        f"    _plugin_module={repr(plugin_module)}",
-        f"    _dialog_dir={repr(dialog_dir)}",
-        "    _exports_dir=os.path.join(_dialog_dir,'exports')",
-        "    os.makedirs(_exports_dir,exist_ok=True)",
-        # IPC helper: write dialog spec and wait for web user response
-        "    def _cwa_wait(spec):",
-        "        req=os.path.join(_dialog_dir,'dialog_request.json')",
-        "        rdy=os.path.join(_dialog_dir,'dialog_ready')",
-        "        rsp=os.path.join(_dialog_dir,'dialog_response.json')",
-        "        rrdy=os.path.join(_dialog_dir,'response_ready')",
-        "        with open(req,'w') as f: json.dump(spec,f)",
-        "        open(rdy,'w').close()",
-        "        dl=time.time()+120",
-        "        while time.time()<dl:",
-        "            if os.path.exists(rrdy):",
-        "                with open(rsp) as f: r=json.load(f)",
-        "                try: os.unlink(rrdy)",
-        "                except: pass",
-        "                try: os.unlink(rsp)",
-        "                except: pass",
-        "                return r",
-        "            time.sleep(0.1)",
-        "        return {'cancelled':True,'timeout':True}",
-        # QApplication (required before creating any Qt widget)
-        "    try:",
-        "        from qt.core import QApplication",
-        "        _app=QApplication.instance() or QApplication([])",
-        "    except Exception:",
-        "        try:",
-        "            from PyQt5.Qt import QApplication",
-        "            _app=QApplication.instance() or QApplication([])",
-        "        except: pass",
-        # Patch calibre.gui2 BEFORE loading plugin (plugin's top-level imports bind at load time)
-        "    try:",
-        "        import calibre.gui2 as _g2",
-        "        def _cwa_warn(p,t,m,*a,**k): _cwa_wait({'type':'warning','title':str(t),'msg':str(m)}); return True",
-        "        def _cwa_err(p,t,m,*a,**k): _cwa_wait({'type':'error','title':str(t),'msg':str(m)}); return True",
-        "        def _cwa_info(p,t,m,*a,**k): _cwa_wait({'type':'info','title':str(t),'msg':str(m)}); return True",
-        "        def _cwa_q(p,t,m,*a,yes_text='Yes',no_text='No',**k):",
-        "            return _cwa_wait({'type':'question','title':str(t),'msg':str(m),'yes':str(yes_text),'no':str(no_text)}).get('value',False)",
-        "        def _cwa_save(p,t,*a,initial_path=None,suggested_filename=None,name='',**k):",
-        "            fn=suggested_filename or name or (os.path.basename(initial_path) if initial_path else 'export.bin')",
-        "            sp=os.path.join(_exports_dir,fn)",
-        "            r=_cwa_wait({'type':'save_file','title':str(t),'filename':fn})",
-        "            return None if r.get('cancelled') else sp",
-        "        def _cwa_open_url(url,*a,**k): _cwa_wait({'type':'open_url','url':str(url)})",
-        "        _g2.warning_dialog=_cwa_warn; _g2.error_dialog=_cwa_err; _g2.info_dialog=_cwa_info",
-        "        _g2.question_dialog=_cwa_q; _g2.open_url=_cwa_open_url",
-        "        _g2.choose_save_file=_cwa_save; _g2.choose_files=lambda p,t,*a,**k: []",
-        "        try:",
-        "            import calibre.gui2.choose_files as _cf",
-        "            _cf.choose_save_file=_cwa_save; _cf.choose_files=lambda p,t,*a,**k: []",
-        "        except: pass",
-        "    except: pass",
-        # Patch QInputDialog and QFileDialog with pure-Python replacements
-        "    try:",
-        "        import qt.core as _qtc",
-        "        _w=_cwa_wait",
-        "        _ed=_exports_dir",
-        "        class _CWAI:",
-        "            @staticmethod",
-        "            def getText(p,t,l,*a,text='',**k):",
-        "                r=_w({'type':'text_input','title':str(t),'label':str(l),'default':str(text)})",
-        "                return ('',False) if r.get('cancelled') else (r.get('value',''),True)",
-        "            @staticmethod",
-        "            def getItem(p,t,l,items,current=0,*a,**k):",
-        "                il=list(items)",
-        "                r=_w({'type':'select','title':str(t),'label':str(l),'items':il,'current':int(current)})",
-        "                return ('',False) if r.get('cancelled') else (r.get('value',il[0] if il else ''),True)",
-        "        class _CWAFD:",
-        "            @staticmethod",
-        "            def getSaveFileName(p,t='Save',directory='',filter='',*a,**k):",
-        "                fn=os.path.basename(directory) or 'export.bin'",
-        "                sp=os.path.join(_ed,fn)",
-        "                r=_w({'type':'save_file','title':str(t),'filename':fn})",
-        "                return ('',filter) if r.get('cancelled') else (sp,filter)",
-        "            @staticmethod",
-        "            def getOpenFileName(*a,**k): return ('','')",
-        "            @staticmethod",
-        "            def getExistingDirectory(*a,**k): return ''",
-        "        _qtc.QInputDialog=_CWAI; _qtc.QFileDialog=_CWAFD",
-        "    except: pass",
-        # Same patches for plugins that import directly from PyQt5/PyQt6
-        "    try:",
-        "        import PyQt5.QtWidgets as _pqw",
-        "        _pqw.QInputDialog=_CWAI; _pqw.QFileDialog=_CWAFD",
-        "    except: pass",
-        "    try:",
-        "        import PyQt6.QtWidgets as _pqw6",
-        "        _pqw6.QInputDialog=_CWAI; _pqw6.QFileDialog=_CWAFD",
-        "    except: pass",
-        # Patch QMessageBox (used by plugins that call it directly instead of calibre wrappers)
-        "    try:",
-        "        import qt.core as _qtc2",
-        "        _w2=_cwa_wait",
-        "        class _CWAMB:",
-        "            Yes=16384; No=65536; Ok=1024; Cancel=4194304; StandardButton=type('SB',(),{'Yes':16384,'No':65536,'Ok':1024,'Cancel':4194304})()",
-        "            @staticmethod",
-        "            def question(p,t,m,*a,**k):",
-        "                return _CWAMB.Yes if _w2({'type':'question','title':str(t),'msg':str(m)}).get('value') else _CWAMB.No",
-        "            @staticmethod",
-        "            def warning(p,t,m,*a,**k):",
-        "                _w2({'type':'warning','title':str(t),'msg':str(m)}); return _CWAMB.Ok",
-        "            @staticmethod",
-        "            def information(p,t,m,*a,**k):",
-        "                _w2({'type':'info','title':str(t),'msg':str(m)}); return _CWAMB.Ok",
-        "            @staticmethod",
-        "            def critical(p,t,m,*a,**k):",
-        "                _w2({'type':'error','title':str(t),'msg':str(m)}); return _CWAMB.Ok",
-        "            @classmethod",
-        "            def exec_(cls): return cls.Ok",
-        "            def __call__(self,*a,**k): return self",
-        "        _qtc2.QMessageBox=_CWAMB",
-        "    except: pass",
-        "    try:",
-        "        import PyQt5.QtWidgets as _pqw2",
-        "        _pqw2.QMessageBox=_CWAMB",
-        "    except: pass",
-        # Load plugin and execute method
-        "    _pkg='calibre_plugins.'+_plugin_module",
-        "    tmpdir=tempfile.mkdtemp(prefix='cwa_action_')",
-        "    try:",
-        "        with zipfile.ZipFile(_zip) as z: z.extractall(tmpdir)",
-        "        sys.path.insert(0,tmpdir)",
-        "        for _zf in sorted(os.listdir(tmpdir)):",
-        "            if not _zf.endswith('.zip'): continue",
-        "            _stem=_zf[:-4]; _nd=os.path.join(tmpdir,'_lib_'+_stem)",
-        "            os.makedirs(_nd,exist_ok=True)",
-        "            with zipfile.ZipFile(os.path.join(tmpdir,_zf)) as _nz: _nz.extractall(_nd)",
-        "            _inner=os.path.join(_nd,_stem)",
-        "            sys.path.insert(0,_inner if os.path.isdir(_inner) else _nd)",
-        "        if 'calibre_plugins' not in sys.modules: sys.modules['calibre_plugins']=types.ModuleType('calibre_plugins')",
-        "        if _pkg not in sys.modules:",
-        "            _pm=types.ModuleType(_pkg); _pm.__path__=[tmpdir]; _pm.__package__=_pkg",
-        "            sys.modules[_pkg]=_pm",
-        "        for _pyf in ['__init__.py','prefs.py','config.py']:",
-        "            _fpath=os.path.join(tmpdir,_pyf)",
-        "            if not os.path.exists(_fpath): continue",
-        "            _modn=_pkg+'.'+_pyf[:-3]",
-        "            if _modn in sys.modules: continue",
-        "            _sp=importlib.util.spec_from_file_location(_modn,_fpath)",
-        "            _m=importlib.util.module_from_spec(_sp); _m.__package__=_pkg",
-        "            sys.modules[_modn]=_m",
-        "            try: _sp.loader.exec_module(_m)",
-        "            except (Exception,SystemExit): sys.modules.pop(_modn,None)",
-        "        loaded=False",
-        "        for fname in ['config.py','prefs.py','__init__.py']:",
-        "            _modn=_pkg+'.'+fname[:-3]",
-        "            mod=sys.modules.get(_modn)",
-        "            if not mod: continue",
-        "            cls=getattr(mod,_cls_name,None)",
-        "            if not cls: continue",
-        "            try:",
-        "                try: obj=cls(_zip)",
-        "                except TypeError: obj=cls()",
-        "                fn=getattr(obj,_method,None)",
-        "                if fn:",
-        "                    result=fn()",
-        "                    exports=os.listdir(_exports_dir)",
-        "                    if exports: print('CWA_SUCCESS:'+str(result if result is not None else 'Done')+'|EXPORTS:'+','.join(exports))",
-        "                    else: print('CWA_SUCCESS:'+str(result if result is not None else 'Done'))",
-        "                else: print('CWA_ERROR:Method '+_method+' not found on '+_cls_name)",
-        "            except Exception as e: print('CWA_ERROR:'+str(e))",
-        "            loaded=True; break",
-        "        if not loaded: print('CWA_ERROR:Config class not found')",
-        "    except (Exception,SystemExit) as e: print('CWA_ERROR:'+str(e))",
-        "    finally:",
-        "        shutil.rmtree(tmpdir,ignore_errors=True)",
-        # Top-level call — found via LOAD_NAME (locals lookup) from exec scope
-        "_run()",
-    ]
-    return "\n".join(lines)
+def _cleanup_orphan_session_dirs():
+    """
+    Remove leftover cwa_sess_* and cwa_action_* directories from previous runs.
+    Called once on module import — best effort; failures are logged but
+    non-fatal because the worst case is a few extra MB in /tmp.
+    """
+    tmp = tempfile.gettempdir()
+    try:
+        for name in os.listdir(tmp):
+            if name.startswith('cwa_sess_') or name.startswith('cwa_action_'):
+                path = os.path.join(tmp, name)
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+    except OSError as e:
+        log.warning("Could not clean orphan plugin session dirs in %s: %s", tmp, e)
+
+
+_cleanup_orphan_session_dirs()
+
+
+def _delayed_session_cleanup(session_id):
+    """After SESSION_RETENTION seconds, drop the session and wipe its dialog_dir."""
+    time.sleep(SESSION_RETENTION)
+    with _sessions_lock:
+        session = _active_sessions.pop(session_id, None)
+    if session:
+        dd = session.get('dialog_dir')
+        if dd and os.path.exists(dd):
+            shutil.rmtree(dd, ignore_errors=True)
+
+
+def _read_result_file(dialog_dir):
+    """Parse <dialog_dir>/result.json. Returns (success, message, files) or None."""
+    result_path = os.path.join(dialog_dir, 'result.json')
+    if not os.path.exists(result_path):
+        return None
+    try:
+        with open(result_path, encoding='utf-8') as f:
+            data = json.load(f)
+        return (
+            bool(data.get('success')),
+            str(data.get('message', '')),
+            list(data.get('files') or []),
+        )
+    except Exception as e:
+        log.error("Failed to read result.json at %s: %s", result_path, e)
+        return None
 
 
 def _run_session_thread(session_id, zip_path, config_class, method_name, plugin_name):
-    plugin_module = re.sub(r'[^a-z0-9_]', '', plugin_name.lower().replace(' ', '_').replace('-', '_'))
+    """
+    Background thread that launches the runner subprocess, waits for it,
+    parses result.json, and updates the session state.
+    """
+    plugin_module = _normalize_plugin_module(plugin_name)
     dialog_dir = tempfile.mkdtemp(prefix='cwa_sess_')
 
-    with _sessions_lock:
-        _active_sessions[session_id]['dialog_dir'] = dialog_dir
-        _active_sessions[session_id]['status'] = 'running'
-
-    script = _build_subprocess_script(zip_path, config_class, method_name, plugin_module, dialog_dir)
     env = _get_subprocess_env()
     env['QT_QPA_PLATFORM'] = 'offscreen'
     env['PYTHONUNBUFFERED'] = '1'
+    env['CWA_ZIP']        = zip_path
+    env['CWA_CLASS']      = config_class
+    env['CWA_METHOD']     = method_name
+    env['CWA_MODULE']     = plugin_module
+    env['CWA_DIALOG_DIR'] = dialog_dir
 
     try:
         proc = subprocess.Popen(
-            ['calibre-debug', '-c', script],
+            ['calibre-debug', RUNNER_SCRIPT],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=env
         )
-        stdout, stderr = proc.communicate(timeout=300)
-        output = (stdout or '') + (stderr or '')
+    except Exception as e:
+        log.error("Failed to start plugin runner for %s: %s", plugin_name, e)
+        with _sessions_lock:
+            _active_sessions[session_id].update({
+                'status': 'done', 'success': False, 'message': str(e),
+                'dialog_dir': dialog_dir,
+            })
+        threading.Thread(target=_delayed_session_cleanup, args=(session_id,), daemon=True).start()
+        return
 
-        success = False
-        message = _("Action completed without result")
-        files = []
+    with _sessions_lock:
+        _active_sessions[session_id].update({
+            'dialog_dir': dialog_dir,
+            'proc': proc,
+            'status': 'running',
+        })
 
-        for line in output.splitlines():
-            if line.startswith('CWA_SUCCESS:'):
-                msg = line[len('CWA_SUCCESS:'):]
-                if '|EXPORTS:' in msg:
-                    parts = msg.split('|EXPORTS:', 1)
-                    msg, files = parts[0], [f.strip() for f in parts[1].split(',') if f.strip()]
-                success, message = True, msg
-                break
-            if line.startswith('CWA_ERROR:'):
-                message = line[len('CWA_ERROR:'):]
-                break
+    try:
+        _, stderr = proc.communicate(timeout=SUBPROCESS_TIMEOUT)
+
+        parsed = _read_result_file(dialog_dir)
+        if parsed is not None:
+            success, message, files = parsed
+        else:
+            # The runner exited without writing result.json — interpret as a crash.
+            success = False
+            files = []
+            stderr_tail = (stderr or '')[-500:].strip()
+            log.warning("Plugin runner for session %s exited without result.json. stderr tail: %s",
+                        session_id, stderr_tail or '(empty)')
+            if stderr_tail:
+                message = _("Action crashed: %(err)s", err=stderr_tail)
+            else:
+                message = _("Action exited without producing a result")
 
         with _sessions_lock:
-            _active_sessions[session_id].update({'status': 'done', 'success': success, 'message': message, 'files': files})
+            _active_sessions[session_id].update({
+                'status': 'done', 'success': success,
+                'message': message, 'files': files,
+            })
 
     except subprocess.TimeoutExpired:
-        try: proc.kill()
-        except: pass
+        log.warning("Plugin action session %s timed out after %ds", session_id, SUBPROCESS_TIMEOUT)
+        try:
+            proc.kill()
+        except Exception:
+            pass
         with _sessions_lock:
-            _active_sessions[session_id].update({'status': 'done', 'success': False, 'message': _("Action timed out")})
+            _active_sessions[session_id].update({
+                'status': 'done', 'success': False,
+                'message': _("Action timed out after %(t)d seconds", t=SUBPROCESS_TIMEOUT),
+            })
     except Exception as e:
+        log.exception("Plugin action session %s failed unexpectedly", session_id)
         with _sessions_lock:
-            _active_sessions[session_id].update({'status': 'done', 'success': False, 'message': str(e)})
+            _active_sessions[session_id].update({
+                'status': 'done', 'success': False, 'message': str(e),
+            })
     finally:
-        def _cleanup():
-            time.sleep(300)
-            with _sessions_lock:
-                sess = _active_sessions.pop(session_id, None)
-            if sess:
-                dd = sess.get('dialog_dir')
-                if dd and os.path.exists(dd):
-                    shutil.rmtree(dd, ignore_errors=True)
-        threading.Thread(target=_cleanup, daemon=True).start()
+        threading.Thread(target=_delayed_session_cleanup, args=(session_id,), daemon=True).start()
 
 
 def run_plugin_action_async(plugin_name, action_name):
+    """
+    Look up the Python method bound to the requested button via the AST parser
+    and launch the runner in a background thread. Returns a session_id the
+    caller can poll via get_plugin_action_status().
+
+    Raises NotImplementedError if the AST parser could not find a method linked
+    to the button (e.g. the plugin uses a lambda or signal we don't recognize).
+    """
     from .calibre_plugin_parser import parse_plugin_zip
 
     zip_path = get_plugin_zip_path(plugin_name)
@@ -536,11 +360,11 @@ def run_plugin_action_async(plugin_name, action_name):
 
     if not method_name:
         raise NotImplementedError(
-            f"No executable handler found for action '{action_name}' on plugin '{plugin_name}'"
+            "No executable handler found for action '%s' on plugin '%s'" % (action_name, plugin_name)
         )
 
     config_class = schema.config_class.split(',')[0].strip() if schema.config_class else 'ConfigWidget'
-    session_id = uuid.uuid4().hex[:12]
+    session_id = uuid.uuid4().hex
 
     with _sessions_lock:
         _active_sessions[session_id] = {
@@ -548,6 +372,7 @@ def run_plugin_action_async(plugin_name, action_name):
             'plugin_name': plugin_name,
             'action_name': action_name,
             'dialog_dir': None,
+            'proc': None,
             'created_at': time.time(),
         }
 
@@ -557,10 +382,13 @@ def run_plugin_action_async(plugin_name, action_name):
         daemon=True
     ).start()
 
+    log.info("Plugin action started: plugin='%s' action='%s' method='%s' session=%s",
+             plugin_name, action_name, method_name, session_id)
     return session_id
 
 
 def get_plugin_action_status(session_id):
+    """Return a status dict for the given session: running / dialog / done / not_found."""
     with _sessions_lock:
         session = _active_sessions.get(session_id)
 
@@ -571,7 +399,11 @@ def get_plugin_action_status(session_id):
     dialog_dir = session.get('dialog_dir')
 
     if status == 'done':
-        result = {'status': 'done', 'success': session.get('success', False), 'message': session.get('message', '')}
+        result = {
+            'status': 'done',
+            'success': session.get('success', False),
+            'message': session.get('message', ''),
+        }
         if session.get('files'):
             result['files'] = session['files']
         return result
@@ -581,35 +413,76 @@ def get_plugin_action_status(session_id):
         req_file = os.path.join(dialog_dir, 'dialog_request.json')
         if os.path.exists(ready_file) and os.path.exists(req_file):
             try:
-                with open(req_file) as f:
+                with open(req_file, encoding='utf-8') as f:
                     return {'status': 'dialog', 'dialog': json.load(f)}
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("Could not read dialog request for session %s: %s", session_id, e)
 
     return {'status': 'running'}
 
 
 def respond_to_plugin_dialog(session_id, response_data):
+    """Write the user's reply for a pending dialog and unblock the runner."""
     with _sessions_lock:
         session = _active_sessions.get(session_id)
 
     if not session:
-        raise ValueError(f"Session {session_id} not found")
+        raise ValueError("Session %s not found" % session_id)
 
     dialog_dir = session.get('dialog_dir')
     if not dialog_dir:
         raise ValueError("No dialog pending for this session")
 
-    with open(os.path.join(dialog_dir, 'dialog_response.json'), 'w') as f:
+    ready_file = os.path.join(dialog_dir, 'dialog_ready')
+    if not os.path.exists(ready_file):
+        raise ValueError("No dialog awaiting response for this session")
+
+    with open(os.path.join(dialog_dir, 'dialog_response.json'), 'w', encoding='utf-8') as f:
         json.dump(response_data, f)
 
-    try: os.unlink(os.path.join(dialog_dir, 'dialog_ready'))
-    except: pass
+    try:
+        os.unlink(ready_file)
+    except OSError:
+        pass
 
     open(os.path.join(dialog_dir, 'response_ready'), 'w').close()
 
 
+def cancel_plugin_action(session_id):
+    """
+    Kill the subprocess and clean up the session immediately.
+    Returns True if a session was cancelled, False if it didn't exist.
+    """
+    with _sessions_lock:
+        session = _active_sessions.get(session_id)
+    if not session:
+        return False
+
+    proc = session.get('proc')
+    if proc and proc.poll() is None:
+        try:
+            proc.kill()
+        except Exception as e:
+            log.warning("Could not kill plugin subprocess for session %s: %s", session_id, e)
+
+    with _sessions_lock:
+        session = _active_sessions.pop(session_id, None)
+
+    if session:
+        dd = session.get('dialog_dir')
+        if dd and os.path.exists(dd):
+            shutil.rmtree(dd, ignore_errors=True)
+
+    log.info("Plugin action session %s cancelled", session_id)
+    return True
+
+
 def get_plugin_action_file(session_id, filename):
+    """
+    Resolve an exported file path for a session, with traversal protection.
+    Returns the absolute path if the file is inside the session's exports dir,
+    otherwise None.
+    """
     with _sessions_lock:
         session = _active_sessions.get(session_id)
     if not session:
