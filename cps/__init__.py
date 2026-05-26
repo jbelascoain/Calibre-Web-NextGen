@@ -69,7 +69,6 @@ mimetypes.add_type('text/javascript; charset=UTF-8', '.js')
 mimetypes.add_type('application/vnd.adobe.adept+xml', '.acsm')
 mimetypes.add_type('application/vnd.amazon.ebook', '.kfx')
 mimetypes.add_type('application/zip', '.kfx-zip')
-mimetypes.add_type('application/zip', '.zip')
 
 log = logger.create()
 
