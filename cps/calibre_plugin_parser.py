@@ -893,42 +893,80 @@ def _do_parse_plugin_zip(zip_path: str) -> PluginSchema:
 
     def _catalog_custom_widgets(tree: ast.AST, dialog_classes: set) -> dict:
         """
-        Pre-pass: find every ``class XYZ(QWidget)`` declared in this tree
-        that isn't a config-class candidate (won't be the primary) and isn't
-        a QDialog subclass (those are handled by the sub-dialog path). For
-        each, sniff the ``__init__`` body for a single primary inner Qt
-        widget — a ``self.foo = QSomething(...)`` assignment whose widget
-        type is in QT_TO_FIELD and isn't a button.
+        Pre-pass: catalog plugin-defined widget classes the parser should
+        recognize as fields when used inside the primary ConfigWidget. Two
+        shapes are detected:
+
+          1. Transparent subclass of a stock Qt widget
+                 ``class StyledLineEdit(QLineEdit): ...``
+             The class itself IS the value-bearing widget — its instances
+             behave like the parent class (text(), value(), etc.). We
+             register it with ``inner_attr=None`` so the runner uses the
+             instance directly, no inner navigation.
+
+          2. Wrapper QWidget around a single primary inner Qt widget
+                 ``class TokenInput(QWidget):
+                     def __init__(self, parent=None):
+                         self.line_edit = QLineEdit(self)``
+             The wrapper isn't itself a value-bearing widget; the value
+             lives one hop deeper on a known attribute. We register it
+             with ``inner_attr`` set so the runner walks
+             ``instance.<outer>.<inner_attr>``.
+
+        QDialog subclasses and config-class base subclasses
+        (ConfigWidget/ConfigWidgetBase) are excluded — they go through
+        the sub-dialog / primary paths respectively.
 
         Returns a dict::
 
-            { custom_class_name: { 'inner_attr': str,
+            { custom_class_name: { 'inner_attr': str | None,
                                    'inner_type': str,
                                    'inner_options': [str, ...] } }
 
-        Custom widgets with zero recognized inner fields, or with two or
-        more recognized inner fields, are NOT cataloged — too ambiguous to
-        proxy cleanly through the web. Plugin code can still use them; they
-        just won't surface in the schema.
+        Wrappers with zero recognized inner fields, or with 2+ recognized
+        inner fields, are NOT cataloged — too ambiguous to proxy cleanly
+        through the web. Plugin code can still use them; they just won't
+        surface in the schema.
         """
         catalog: dict = {}
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef):
                 continue
             bases = {get_name(b) for b in node.bases}
-            # Only QWidget subclasses that aren't QDialog subclasses are
-            # candidates. ConfigWidget/ConfigWidgetBase base names belong
-            # to the primary class path and are excluded too.
-            if "QWidget" not in bases:
-                continue
+
+            # Skip QDialog subclasses (handled by the sub-dialog path) and
+            # the explicit Calibre config bases (handled by the primary path).
             if bases & ConfigClassVisitor.DIALOG_BASE_CLASSES:
                 continue
             if {"ConfigWidget", "ConfigWidgetBase"} & bases:
                 continue
-            if node.name in dialog_classes:
+
+            # Shape 1: transparent subclass of a stock value-bearing Qt widget.
+            # Buttons are excluded — a subclassed QPushButton is still an
+            # action, not a value-bearing field. Collection widgets (list /
+            # table) are excluded too because they live in the manager path,
+            # not the simple-field path.
+            inherited_type = None
+            for base_name in bases:
+                cand = QT_TO_FIELD.get(base_name)
+                if cand and cand not in ('button', 'list', 'table'):
+                    inherited_type = cand
+                    break
+            if inherited_type is not None:
+                catalog[node.name] = {
+                    'inner_attr': None,
+                    'inner_type': inherited_type,
+                    'inner_options': [],
+                }
                 continue
 
-            # Walk the class body looking for self.X = QSomething(...).
+            # Shape 2: QWidget wrapper around a single inner field. Limit to
+            # direct QWidget subclasses to keep the pattern unambiguous —
+            # other widget bases are either covered by shape 1 above or
+            # too specialized to assume the wrapper semantics.
+            if "QWidget" not in bases:
+                continue
+
             inner_fields = []
             for body_node in ast.walk(node):
                 if not isinstance(body_node, ast.Assign):
@@ -971,7 +1009,7 @@ def _do_parse_plugin_zip(zip_path: str) -> PluginSchema:
                 }
         return catalog
 
-    def _select_primary_class(tree: ast.AST) -> Optional[str]:
+    def _select_primary_class(tree: ast.AST, exclude: Optional[set] = None) -> Optional[str]:
         """
         Pre-pass: pick the class most likely to be the plugin's primary
         config widget. Strategy:
@@ -984,8 +1022,14 @@ def _do_parse_plugin_zip(zip_path: str) -> PluginSchema:
              subclass (rare — happens with old plugins whose root config IS
              a modal dialog), fall back to the first one in source order.
 
+        Classes listed in ``exclude`` (typically custom widget classes the
+        catalog identified — wrappers that aren't the plugin's main entry
+        point) are skipped so they don't outrank the real primary just for
+        being defined earlier in source.
+
         Returns None when no config-base subclass is found at all.
         """
+        exclude = exclude or set()
         non_dialog_candidates: list[str] = []
         all_candidates: list[str] = []
         dialog_bases = ConfigClassVisitor.DIALOG_BASE_CLASSES
@@ -993,6 +1037,8 @@ def _do_parse_plugin_zip(zip_path: str) -> PluginSchema:
 
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef):
+                continue
+            if node.name in exclude:
                 continue
             bases = {get_name(b) for b in node.bases}
             if not (bases & config_bases):
@@ -1020,8 +1066,11 @@ def _do_parse_plugin_zip(zip_path: str) -> PluginSchema:
             continue
 
         dialog_classes = _collect_dialog_class_names(tree)
-        primary = _select_primary_class(tree)
         custom_widgets = _catalog_custom_widgets(tree, dialog_classes)
+        # Custom widget classes (wrappers like ``TokenInput(QWidget)``)
+        # mustn't be picked as the primary config class even when they
+        # appear earlier in source order, so we exclude them up front.
+        primary = _select_primary_class(tree, exclude=set(custom_widgets.keys()))
         visitor = ConfigClassVisitor(
             dialog_class_names=dialog_classes,
             primary_class_name=primary,
@@ -1054,8 +1103,8 @@ def _do_parse_plugin_zip(zip_path: str) -> PluginSchema:
         try:
             tree = ast.parse(files["__init__.py"])
             dialog_classes = _collect_dialog_class_names(tree)
-            primary = _select_primary_class(tree)
             custom_widgets = _catalog_custom_widgets(tree, dialog_classes)
+            primary = _select_primary_class(tree, exclude=set(custom_widgets.keys()))
             visitor = ConfigClassVisitor(
                 dialog_class_names=dialog_classes,
                 primary_class_name=primary,

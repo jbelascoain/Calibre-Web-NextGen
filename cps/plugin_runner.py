@@ -420,6 +420,28 @@ def _schema_is_simple_form(dialog_schema):
 _MANAGER_MAX_ACTIONS = 200
 
 
+def _resolve_field_widget(instance, field_def):
+    """
+    Locate the actual value-bearing widget on the instance for a field.
+
+    For plain fields (the common case) the widget lives directly at
+    ``instance.<name>``. For custom-widget fields (Slice 7), the parser
+    set ``inner_attr`` so the runner walks one hop deeper:
+    ``instance.<name>.<inner_attr>``. Returns ``None`` when either step
+    fails — callers treat that as "field absent on this instance".
+    """
+    name = field_def.get('name')
+    if not name:
+        return None
+    outer = getattr(instance, name, None)
+    if outer is None:
+        return None
+    inner = field_def.get('inner_attr')
+    if not inner:
+        return outer
+    return getattr(outer, inner, None)
+
+
 def _read_list_items(widget):
     """
     Best-effort snapshot of a QListWidget's items as a list of strings.
@@ -519,7 +541,7 @@ def _snapshot_manager_state(dialog_instance, dialog_schema):
         ftype = f.get('type')
         if not name:
             continue
-        widget = getattr(dialog_instance, name, None)
+        widget = _resolve_field_widget(dialog_instance, f)
         if widget is None:
             continue
         try:
@@ -705,7 +727,7 @@ def _inject_subdialog_values(dialog_instance, fields, values):
         attr_name = f.get('name')
         if not attr_name:
             continue
-        widget = getattr(dialog_instance, attr_name, None)
+        widget = _resolve_field_widget(dialog_instance, f)
         if widget is None:
             continue
 
@@ -1220,7 +1242,16 @@ def _read_field_value(instance, field_def):
     ftype = field_def.get('type')
     if not name:
         return None
-    widget = vars(instance).get(name)
+    # For plain fields, read straight off the instance __dict__ (bypasses
+    # _MissingWidgetStub). For custom-widget fields (Slice 7), the outer
+    # attribute lives in __dict__ but its inner_attr lives one hop deeper
+    # — we don't have a stub installed at that level, so a normal attr
+    # walk is safe and correct.
+    outer = vars(instance).get(name)
+    if outer is None:
+        return None
+    inner_attr = field_def.get('inner_attr')
+    widget = getattr(outer, inner_attr, None) if inner_attr else outer
     if widget is None:
         return None
     try:
