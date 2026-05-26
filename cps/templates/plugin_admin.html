@@ -463,34 +463,50 @@ document.addEventListener('DOMContentLoaded', function () {
             // No fields detected and low confidence: show a raw JSON fallback editor
             renderJsonFallback(container, savedValues);
         } else if (configFields.length > 0) {
-            var group = $('<div class="plugin-config-group">'
-                + '<span class="plugin-config-group-title">Configuration</span>'
-                + '</div>');
-
+            // Group fields by `section` so QTabWidget-based plugins keep their
+            // logical grouping in the rendered form. Fields with empty section
+            // fall into the default "Configuration" bucket. Section order is
+            // determined by first-seen-in-source.
+            var sectionsOrder = [];
+            var sectionsMap   = {};
             configFields.forEach(function (fieldDef) {
-                // Resolve the current value: prefer a previously saved value,
-                // fall back to the default detected by the parser, then to empty.
-                var currentValue = savedValues.hasOwnProperty(fieldDef.name)
-                    ? savedValues[fieldDef.name]
-                    : (fieldDef.default !== null ? fieldDef.default : '');
-
-                var helpIcon = fieldDef.help_text
-                    ? ' <i class="glyphicon glyphicon-question-sign help-icon"'
-                      + ' title="' + escapeHtml(fieldDef.help_text) + '"'
-                      + ' data-toggle="tooltip"></i>'
-                    : '';
-
-                var row = $('<div class="config-row' + (fieldDef.type === 'checkbox' ? ' config-row-checkbox' : '') + '"></div>');
-                row.append('<label class="config-label">'
-                    + escapeHtml(fieldDef.label) + helpIcon + '</label>');
-
-                var control = $('<div class="config-control"></div>');
-                control.append(buildInputControl(fieldDef, currentValue));
-                row.append(control);
-                group.append(row);
+                var sec = fieldDef.section || '';
+                if (!sectionsMap.hasOwnProperty(sec)) {
+                    sectionsOrder.push(sec);
+                    sectionsMap[sec] = [];
+                }
+                sectionsMap[sec].push(fieldDef);
             });
 
-            container.append(group);
+            sectionsOrder.forEach(function (secName) {
+                var title = secName || 'Configuration';
+                var group = $('<div class="plugin-config-group">'
+                    + '<span class="plugin-config-group-title">' + escapeHtml(title) + '</span>'
+                    + '</div>');
+
+                sectionsMap[secName].forEach(function (fieldDef) {
+                    var currentValue = savedValues.hasOwnProperty(fieldDef.name)
+                        ? savedValues[fieldDef.name]
+                        : (fieldDef.default !== null ? fieldDef.default : '');
+
+                    var helpIcon = fieldDef.help_text
+                        ? ' <i class="glyphicon glyphicon-question-sign help-icon"'
+                          + ' title="' + escapeHtml(fieldDef.help_text) + '"'
+                          + ' data-toggle="tooltip"></i>'
+                        : '';
+
+                    var row = $('<div class="config-row' + (fieldDef.type === 'checkbox' ? ' config-row-checkbox' : '') + '"></div>');
+                    row.append('<label class="config-label">'
+                        + escapeHtml(fieldDef.label) + helpIcon + '</label>');
+
+                    var control = $('<div class="config-control"></div>');
+                    control.append(buildInputControl(fieldDef, currentValue));
+                    row.append(control);
+                    group.append(row);
+                });
+
+                container.append(group);
+            });
         }
 
         // -- Render action buttons --------------------------------------------
@@ -583,6 +599,85 @@ document.addEventListener('DOMContentLoaded', function () {
                 if (fieldDef.max !== null) numInput.attr('max', fieldDef.max);
                 return numInput;
 
+            case 'slider':
+                // Range slider — value is read as a number.
+                var sliderWrap = $('<div style="display:flex;align-items:center;gap:8px;">');
+                var sliderInput = $('<input type="range" class="form-control" style="padding:0;flex:1;">')
+                    .attr('name', name)
+                    .attr('data-field-type', 'slider');
+                if (fieldDef.min !== null) sliderInput.attr('min', fieldDef.min);
+                if (fieldDef.max !== null) sliderInput.attr('max', fieldDef.max);
+                if (currentValue !== '' && currentValue !== null && currentValue !== undefined) {
+                    sliderInput.val(currentValue);
+                }
+                var sliderLabel = $('<span style="min-width:40px;text-align:right;font-variant-numeric:tabular-nums;">')
+                    .text(sliderInput.val() || '');
+                sliderInput.on('input', function () { sliderLabel.text($(this).val()); });
+                sliderWrap.append(sliderInput, sliderLabel);
+                return sliderWrap;
+
+            case 'radio':
+                // Single radio button. Mutual exclusion is plugin-side
+                // (QButtonGroup); here we just expose the on/off state per
+                // radio. The user toggles individual radios; the plugin's
+                // own logic decides what to do with combinations.
+                var radioChecked = (currentValue === true || currentValue === 'true' || currentValue === 1);
+                return $('<div class="checkbox" style="margin:0;">'
+                    + '<label>'
+                    + '<input type="radio"'
+                    + ' name="' + escapeHtml(name) + '"'
+                    + ' data-field-type="radio"'
+                    + ' value="' + escapeHtml(name) + '"'
+                    + (radioChecked ? ' checked' : '')
+                    + '>'
+                    + '</label>'
+                    + '</div>');
+
+            case 'list':
+                // QListWidget — read-only view of plugin-managed items.
+                // Editable list management lives in manager-mode sub-dialogs.
+                var lc = (currentValue && currentValue.length)
+                    ? currentValue
+                    : (fieldDef.options || []);
+                var lWrap = $('<div class="cwa-readonly-list" style="border:1px solid rgba(255,255,255,0.15);'
+                    + 'padding:6px;border-radius:4px;max-height:120px;overflow-y:auto;font-size:12px;">');
+                if (!lc || lc.length === 0) {
+                    lWrap.append($('<div style="color:#888;font-style:italic;">').text('(no items)'));
+                } else {
+                    lc.forEach(function (item) {
+                        lWrap.append($('<div>').text(String(item)));
+                    });
+                }
+                return lWrap;
+
+            case 'table':
+                // QTableWidget — read-only view of plugin-managed rows.
+                var tWrap = $('<div class="cwa-readonly-table" style="border:1px solid rgba(255,255,255,0.15);'
+                    + 'padding:6px;border-radius:4px;max-height:160px;overflow:auto;font-size:12px;">');
+                var tdata = currentValue && currentValue.rows ? currentValue : { headers: [], rows: [] };
+                if (!tdata.rows || tdata.rows.length === 0) {
+                    tWrap.append($('<div style="color:#888;font-style:italic;">').text('(no rows)'));
+                } else {
+                    var tbl = $('<table class="table table-condensed" style="margin:0;">');
+                    if (tdata.headers && tdata.headers.length) {
+                        var thead = $('<thead>').append(
+                            $('<tr>').append(tdata.headers.map(function (h) {
+                                return $('<th>').text(h);
+                            }))
+                        );
+                        tbl.append(thead);
+                    }
+                    var tbody = $('<tbody>');
+                    tdata.rows.forEach(function (row) {
+                        var tr = $('<tr>');
+                        row.forEach(function (cell) { tr.append($('<td>').text(cell)); });
+                        tbody.append(tr);
+                    });
+                    tbl.append(tbody);
+                    tWrap.append(tbl);
+                }
+                return tWrap;
+
             default:
                 // Unknown type: render as plain text as a safe fallback
                 return $('<input class="form-control input-sm" type="text">')
@@ -630,9 +725,11 @@ document.addEventListener('DOMContentLoaded', function () {
 
             switch (fieldType) {
                 case 'checkbox':
+                case 'radio':
                     config[name] = el.is(':checked');
                     break;
                 case 'number':
+                case 'slider':
                     var numVal = el.val();
                     config[name] = numVal !== '' ? Number(numVal) : null;
                     break;
@@ -743,9 +840,8 @@ document.addEventListener('DOMContentLoaded', function () {
 
         area.find('.cwa-dialog-title').text(dialog.title || 'Plugin');
 
-        function submit(value, cancelled) {
+        function postResponse(payload) {
             area.hide();
-            var payload = cancelled ? { cancelled: true } : { value: value };
             $.ajax({
                 url: responseUrl,
                 type: 'POST',
@@ -754,6 +850,10 @@ document.addEventListener('DOMContentLoaded', function () {
                 headers: { 'X-CSRFToken': csrfToken },
                 complete: callback
             });
+        }
+
+        function submit(value, cancelled) {
+            postResponse(cancelled ? { cancelled: true } : { value: value });
         }
 
         function msgBlock(iconClass, iconColor, msg) {
@@ -842,6 +942,202 @@ document.addEventListener('DOMContentLoaded', function () {
                     submit(true, false);
                 });
                 footer.append(btnOK);
+                break;
+
+            case 'manager_dialog':
+                // Interactive manager session (Slice 2). The runner stays in a
+                // loop on the dialog instance: each click here sends an action,
+                // the runner runs the matching dialog method, snapshots the
+                // new state, and re-emits another manager_dialog spec — the
+                // poll loop picks that up and re-renders.
+                var mgrState = dialog.state || {};
+                var mgrLists = mgrState.lists || {};
+                var mgrTables = mgrState.tables || {};
+                var mgrTexts = mgrState.texts || {};
+                var mgrActions = dialog.actions || [];
+                var primaryListName = dialog.primary_list;
+                var primaryKind = dialog.primary_kind || 'list';
+                var selectedIndex = null;
+
+                // Render the primary collection (list or table) as a selectable view.
+                if (primaryListName && primaryKind === 'list') {
+                    var listItems = mgrLists[primaryListName] || [];
+                    var $list = $('<div class="cwa-mgr-list list-group" style="margin-bottom:10px;max-height:200px;overflow-y:auto;">');
+                    if (listItems.length === 0) {
+                        $list.append($('<div class="list-group-item" style="font-style:italic;color:#888;">').text('(no items)'));
+                    } else {
+                        listItems.forEach(function (text, idx) {
+                            var $item = $('<a href="#" class="list-group-item cwa-mgr-list-item">')
+                                .text(text)
+                                .attr('data-index', idx)
+                                .on('click', function (e) {
+                                    e.preventDefault();
+                                    $list.find('.cwa-mgr-list-item').removeClass('active');
+                                    $(this).addClass('active');
+                                    selectedIndex = idx;
+                                });
+                            $list.append($item);
+                        });
+                    }
+                    body.append($list);
+                } else if (primaryListName && primaryKind === 'table') {
+                    var tdata = mgrTables[primaryListName] || { headers: [], rows: [] };
+                    var $tableWrap = $('<div class="cwa-mgr-table-wrap" style="margin-bottom:10px;max-height:240px;overflow:auto;">');
+                    if (!tdata.rows || tdata.rows.length === 0) {
+                        $tableWrap.append($('<div class="list-group-item" style="font-style:italic;color:#888;">').text('(no rows)'));
+                    } else {
+                        var $tbl = $('<table class="table table-condensed cwa-mgr-table" style="margin:0;cursor:pointer;">');
+                        if (tdata.headers && tdata.headers.length) {
+                            var $thead = $('<thead>').append(
+                                $('<tr>').append(tdata.headers.map(function (h) {
+                                    return $('<th>').text(h);
+                                }))
+                            );
+                            $tbl.append($thead);
+                        }
+                        var $tbody = $('<tbody>');
+                        tdata.rows.forEach(function (row, ridx) {
+                            var $tr = $('<tr>').attr('data-index', ridx).on('click', function () {
+                                $tbody.find('tr').removeClass('active');
+                                $(this).addClass('active');
+                                selectedIndex = ridx;
+                            });
+                            row.forEach(function (cell) { $tr.append($('<td>').text(cell)); });
+                            $tbody.append($tr);
+                        });
+                        $tbl.append($tbody);
+                        $tableWrap.append($tbl);
+                    }
+                    body.append($tableWrap);
+                }
+
+                // Render any additional text fields that the manager exposes
+                // alongside its list (e.g. wine prefix path in DeDRM's
+                // ManageKeysDialog). Read-only at Slice 2 — we just show them.
+                Object.keys(mgrTexts).forEach(function (fname) {
+                    var v = mgrTexts[fname];
+                    if (!v) return;
+                    body.append($('<div style="margin-bottom:8px;color:#aaa;font-size:12px;">').text(fname + ': ' + v));
+                });
+
+                // Action button bar — one button per resolved manager action.
+                var $actionBar = $('<div class="cwa-mgr-actions" style="margin-bottom:10px;">');
+                mgrActions.forEach(function (action) {
+                    var $btn = $('<button class="btn btn-default btn-sm" style="margin-right:6px;margin-bottom:4px;">')
+                        .text(action.label)
+                        .on('click', function () {
+                            postResponse({
+                                action: 'button',
+                                method: action.method,
+                                field: primaryListName,
+                                index: selectedIndex,
+                            });
+                        });
+                    $actionBar.append($btn);
+                });
+                body.append($actionBar);
+
+                // Close buttons — OK closes with Accepted, Cancel with Rejected.
+                btnOK.text('OK').on('click', function () {
+                    postResponse({ action: 'close', accepted: true });
+                });
+                btnCancel.text('Cancel').on('click', function () {
+                    postResponse({ action: 'close', accepted: false });
+                });
+                footer.append(btnOK, btnCancel);
+                break;
+
+            case 'subdialog':
+                // Render a form built from the dialog's parsed field schema. On submit,
+                // gather each field's value into { fieldName: value, ... } and post
+                // it back. The runner injects those values into the matching Qt widgets
+                // on the dialog instance so subsequent plugin reads see them.
+                var subdlgFields = dialog.fields || [];
+                var inputRefs = [];   // { name, type, options, readValue() }
+
+                subdlgFields.forEach(function (fdef) {
+                    var fname = fdef.name;
+                    var ftype = fdef.type;
+                    var flabel = fdef.label || fname;
+
+                    if (ftype === 'checkbox') {
+                        var row = $('<div class="cwa-dialog-field-row" style="margin-bottom:10px;">');
+                        var cb = $('<input type="checkbox">');
+                        row.append($('<label style="cursor:pointer;">').append(cb, ' ', flabel));
+                        body.append(row);
+                        inputRefs.push({ name: fname, readValue: function () { return cb.is(':checked'); } });
+                    } else if (ftype === 'select') {
+                        body.append($('<label class="cwa-dialog-field-label">').text(flabel));
+                        var sel = $('<select class="form-control" style="margin-bottom:10px;">');
+                        (fdef.options || []).forEach(function (opt) {
+                            sel.append($('<option>').val(opt).text(opt));
+                        });
+                        if (fdef.default) sel.val(fdef.default);
+                        body.append(sel);
+                        inputRefs.push({ name: fname, readValue: function () { return sel.val(); } });
+                    } else if (ftype === 'number') {
+                        body.append($('<label class="cwa-dialog-field-label">').text(flabel));
+                        var num = $('<input type="number" class="form-control" style="margin-bottom:10px;">');
+                        if (fdef.min !== null && fdef.min !== undefined) num.attr('min', fdef.min);
+                        if (fdef.max !== null && fdef.max !== undefined) num.attr('max', fdef.max);
+                        if (fdef.default) num.val(fdef.default);
+                        body.append(num);
+                        inputRefs.push({ name: fname, readValue: function () { return parseInt(num.val(), 10) || 0; } });
+                    } else if (ftype === 'textarea') {
+                        body.append($('<label class="cwa-dialog-field-label">').text(flabel));
+                        var ta = $('<textarea class="form-control" rows="3" style="margin-bottom:10px;">');
+                        if (fdef.default) ta.val(fdef.default);
+                        body.append(ta);
+                        inputRefs.push({ name: fname, readValue: function () { return ta.val(); } });
+                    } else if (ftype === 'password') {
+                        body.append($('<label class="cwa-dialog-field-label">').text(flabel));
+                        var pw = $('<input type="password" class="form-control" style="margin-bottom:10px;">');
+                        if (fdef.default) pw.val(fdef.default);
+                        body.append(pw);
+                        inputRefs.push({ name: fname, readValue: function () { return pw.val(); } });
+                    } else if (ftype === 'text') {
+                        body.append($('<label class="cwa-dialog-field-label">').text(flabel));
+                        var txt = $('<input type="text" class="form-control" style="margin-bottom:10px;">');
+                        if (fdef.default) txt.val(fdef.default);
+                        body.append(txt);
+                        inputRefs.push({ name: fname, readValue: function () { return txt.val(); } });
+                    } else if (ftype === 'radio') {
+                        var rrow = $('<div class="cwa-dialog-field-row" style="margin-bottom:10px;">');
+                        var rb = $('<input type="checkbox">');   // rendered as toggle since groups are plugin-driven
+                        rrow.append($('<label style="cursor:pointer;">').append(rb, ' ', flabel));
+                        body.append(rrow);
+                        inputRefs.push({ name: fname, readValue: function () { return rb.is(':checked'); } });
+                    } else if (ftype === 'slider') {
+                        body.append($('<label class="cwa-dialog-field-label">').text(flabel));
+                        var srow = $('<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">');
+                        var sl = $('<input type="range" class="form-control" style="padding:0;flex:1;">');
+                        if (fdef.min !== null && fdef.min !== undefined) sl.attr('min', fdef.min);
+                        if (fdef.max !== null && fdef.max !== undefined) sl.attr('max', fdef.max);
+                        if (fdef.default) sl.val(fdef.default);
+                        var slLabel = $('<span style="min-width:40px;text-align:right;">').text(sl.val() || '');
+                        sl.on('input', function () { slLabel.text($(this).val()); });
+                        srow.append(sl, slLabel);
+                        body.append(srow);
+                        inputRefs.push({ name: fname, readValue: function () { return parseInt(sl.val(), 10) || 0; } });
+                    }
+                    // 'button', 'list', 'table' types inside a simple sub-dialog don't
+                    // belong to Slice 1 — managers (Slice 2) handle them on their own
+                    // separate code path. Anything else is silently skipped.
+                });
+
+                if (inputRefs.length === 0) {
+                    body.append($('<div class="cwa-dialog-msg-text">').text(
+                        'This sub-dialog has no simple form fields. Use the desktop Calibre to interact with it.'
+                    ));
+                }
+
+                btnOK.on('click', function () {
+                    var values = {};
+                    inputRefs.forEach(function (ref) { values[ref.name] = ref.readValue(); });
+                    postResponse({ cancelled: false, values: values });
+                });
+                btnCancel.on('click', function () { postResponse({ cancelled: true }); });
+                footer.append(btnOK, btnCancel);
                 break;
 
             default:

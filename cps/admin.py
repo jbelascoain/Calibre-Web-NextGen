@@ -3389,14 +3389,47 @@ def plugin_config_api(plugin_name):
             'confidence':     'low',
         }
 
+    # Live introspection (Slice 4): run the plugin's __init__ in a subprocess
+    # and filter out fields the AST said exist but the live ConfigWidget didn't
+    # actually create. State-dependent branches (e.g. `if not activated:`) are
+    # the main motivation — without this, the user sees buttons that do
+    # nothing because the underlying attribute was never instantiated.
+    # When introspection fails or returns no usable result, we fall back to
+    # the static schema unchanged.
+    introspection = plugin_manager.introspect_plugin_live_state(plugin_name, schema_dict)
+    present = introspection.get('present_fields')
+    if present is not None:
+        present_set = set(present)
+        # Drop every field whose backing widget didn't materialize on the
+        # live instance — including action buttons. In Calibre plugins the
+        # button widget IS the action surface; without the QPushButton
+        # instance attribute, the desktop UI wouldn't show that button
+        # either. Mirroring the desktop "hidden when not applicable"
+        # behavior here is the right thing for the web UI.
+        original_count = len(schema_dict.get('fields') or [])
+        schema_dict['fields'] = [
+            f for f in (schema_dict.get('fields') or [])
+            if f.get('name') in present_set
+        ]
+        filtered_count = original_count - len(schema_dict['fields'])
+        if filtered_count:
+            log.info(
+                "Live introspection for '%s' filtered %d field(s) absent from runtime state",
+                plugin_name, filtered_count,
+            )
+
     # Load previously saved values and attach them under "saved_values"
-    # so the frontend can pre-populate the form fields
-    saved_values = {}
+    # so the frontend can pre-populate the form fields. Live values from
+    # introspection feed the same map but yield priority to anything the
+    # user explicitly saved earlier — saved values reflect intent, live
+    # values reflect default state at this moment.
+    saved_values = dict(introspection.get('values') or {})
     settings_path = plugin_manager.get_plugin_settings_path(plugin_name)
     if os.path.exists(settings_path):
         try:
             with open(settings_path, 'r', encoding='utf-8') as f:
-                saved_values = json.load(f)
+                stored = json.load(f)
+                saved_values.update(stored)
         except Exception as e:
             log.warning("Could not read saved settings for '%s': %s", plugin_name, e)
 

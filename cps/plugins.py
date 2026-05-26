@@ -178,6 +178,105 @@ def get_plugin_settings_path(plugin_name):
     return os.path.join('/config/.config/calibre/plugins', "%s.json" % norm_name)
 
 
+#: Timeout for the brief introspection subprocess. Init should be fast —
+#: anything past ~20s on a real plugin is unhealthy and we'd rather degrade
+#: to the static schema than block the modal-open path indefinitely.
+INTROSPECT_TIMEOUT = 30
+
+
+def introspect_plugin_live_state(plugin_name, schema_dict):
+    """
+    Run the plugin's ``ConfigWidget.__init__`` in an isolated subprocess and
+    snapshot which attributes really exist plus their current values.
+
+    Returns a dict::
+
+        { 'present_fields': [str, ...], 'values': { name: value, ... } }
+
+    On any failure (subprocess crash, missing config class, write error)
+    returns ``{'present_fields': None}`` to signal "no usable result;
+    callers should keep the static schema as-is". This is a soft optimization
+    layer — the modal must still render even when introspection fails.
+
+    The subprocess is the same ``cps/plugin_runner.py`` script invoked by
+    the action pipeline, just gated by ``CWA_INTROSPECT=1`` to take a
+    different code path (instantiate, snapshot, exit — no Qt event loop,
+    no IPC dialogs).
+    """
+    try:
+        zip_path = get_plugin_zip_path(plugin_name)
+    except Exception as e:
+        log.warning("Introspection: ZIP not found for '%s': %s", plugin_name, e)
+        return {'present_fields': None}
+
+    config_class = (
+        (schema_dict.get('config_class') or 'ConfigWidget').split(',')[0].strip()
+        or 'ConfigWidget'
+    )
+    plugin_module = _normalize_plugin_module(plugin_name)
+    dialog_dir = tempfile.mkdtemp(prefix='cwa_introspect_')
+    schema_path = os.path.join(dialog_dir, 'schema.json')
+    introspection_path = os.path.join(dialog_dir, 'introspection.json')
+
+    try:
+        with open(schema_path, 'w', encoding='utf-8') as f:
+            json.dump(schema_dict, f)
+
+        env = _get_subprocess_env()
+        env['QT_QPA_PLATFORM'] = 'offscreen'
+        env['PYTHONUNBUFFERED'] = '1'
+        env['CWA_ZIP']         = zip_path
+        env['CWA_CLASS']       = config_class
+        # METHOD is unused by the introspection path but plugin_runner.py
+        # reads it at module load before we get to dispatch; supply a stub.
+        env['CWA_METHOD']      = ''
+        env['CWA_MODULE']      = plugin_module
+        env['CWA_DIALOG_DIR']  = dialog_dir
+        env['CWA_SCHEMA']      = schema_path
+        env['CWA_INTROSPECT']  = '1'
+
+        try:
+            proc = subprocess.run(
+                ['calibre-debug', RUNNER_SCRIPT],
+                env=env, capture_output=True, text=True,
+                timeout=INTROSPECT_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("Introspection timed out for '%s' after %ds", plugin_name, INTROSPECT_TIMEOUT)
+            return {'present_fields': None}
+        except FileNotFoundError as e:
+            log.warning("Introspection: calibre-debug not available: %s", e)
+            return {'present_fields': None}
+
+        if not os.path.exists(introspection_path):
+            log.warning(
+                "Introspection: no result file from '%s'; stderr tail: %s",
+                plugin_name, (proc.stderr or '')[-300:].strip() or '(empty)',
+            )
+            return {'present_fields': None}
+
+        try:
+            with open(introspection_path, encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            log.warning("Introspection: could not read result for '%s': %s", plugin_name, e)
+            return {'present_fields': None}
+
+        if data.get('error'):
+            log.info("Introspection for '%s' reported: %s", plugin_name, data['error'])
+            # Even with an error the payload may carry partial present_fields;
+            # accept it if non-empty, otherwise fall through to the static schema.
+            if not data.get('present_fields'):
+                return {'present_fields': None}
+
+        return {
+            'present_fields': list(data.get('present_fields') or []),
+            'values': dict(data.get('values') or {}),
+        }
+    finally:
+        shutil.rmtree(dialog_dir, ignore_errors=True)
+
+
 def get_plugin_zip_path(plugin_name):
     """
     Resolve the on-disk ZIP path for a plugin. Searches the user's calibre
@@ -253,10 +352,16 @@ def _read_result_file(dialog_dir):
         return None
 
 
-def _run_session_thread(session_id, zip_path, config_class, method_name, plugin_name):
+def _run_session_thread(session_id, zip_path, config_class, method_name, plugin_name, schema_dict=None):
     """
     Background thread that launches the runner subprocess, waits for it,
     parses result.json, and updates the session state.
+
+    ``schema_dict`` is an optional ``asdict(PluginSchema)`` dump. When
+    provided, it is serialized to ``<dialog_dir>/schema.json`` and the path
+    is exposed to the runner via ``CWA_SCHEMA``. The runner reads it to
+    learn which sub-dialogs it can render via web IPC vs. fall back on the
+    "not available in web mode" handler.
     """
     plugin_module = _normalize_plugin_module(plugin_name)
     dialog_dir = tempfile.mkdtemp(prefix='cwa_sess_')
@@ -269,6 +374,15 @@ def _run_session_thread(session_id, zip_path, config_class, method_name, plugin_
     env['CWA_METHOD']     = method_name
     env['CWA_MODULE']     = plugin_module
     env['CWA_DIALOG_DIR'] = dialog_dir
+
+    if schema_dict is not None:
+        schema_path = os.path.join(dialog_dir, 'schema.json')
+        try:
+            with open(schema_path, 'w', encoding='utf-8') as f:
+                json.dump(schema_dict, f)
+            env['CWA_SCHEMA'] = schema_path
+        except OSError as e:
+            log.warning("Could not write schema.json for session %s: %s", session_id, e)
 
     try:
         proc = subprocess.Popen(
@@ -348,6 +462,7 @@ def run_plugin_action_async(plugin_name, action_name):
     to the button (e.g. the plugin uses a lambda or signal we don't recognize).
     """
     from .calibre_plugin_parser import parse_plugin_zip
+    from dataclasses import asdict
 
     zip_path = get_plugin_zip_path(plugin_name)
     schema = parse_plugin_zip(zip_path)
@@ -376,9 +491,10 @@ def run_plugin_action_async(plugin_name, action_name):
             'created_at': time.time(),
         }
 
+    schema_dict = asdict(schema)
     threading.Thread(
         target=_run_session_thread,
-        args=(session_id, zip_path, config_class, method_name, plugin_name),
+        args=(session_id, zip_path, config_class, method_name, plugin_name, schema_dict),
         daemon=True
     ).start()
 
